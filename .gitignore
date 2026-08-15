@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+
+# Local application bundles
+/dist/
+
+# Generated intermediate icon files
+Assets/AppIcon.iconset/
