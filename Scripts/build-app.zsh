@@ -4,7 +4,15 @@ set -euo pipefail
 root_dir="${0:A:h:h}"
 cd "$root_dir"
 
-swift build -c release
+# macOS 27 的 Command Line Tools 缺少 SwiftUI 宏插件，直接使用默认 SDK 会构建失败
+# （plugin for module 'SwiftUIMacros' not found）；若本机存在 26.x SDK 则显式使用。
+sdk_flag=()
+fallback_sdk="$(/bin/ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX26*.sdk 2>/dev/null | sort -V | tail -n 1)"
+if [[ -n "$fallback_sdk" ]]; then
+  sdk_flag=(--sdk "$fallback_sdk")
+fi
+
+swift build -c release "${sdk_flag[@]}"
 
 app_dir="$root_dir/dist/别睡.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
@@ -33,7 +41,7 @@ cat > "$app_dir/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.0</string>
+    <string>1.3.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>

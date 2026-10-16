@@ -8,6 +8,7 @@
 ## 功能
 
 - 合盖后继续运行：通过 `pmset -a disablesleep 1` 临时阻止合盖睡眠。
+- 免密码模式：一次性授权后，开始与恢复操作不再弹出密码框。
 - 预设时长：1、2、4、8 小时；也支持自定义时长，最长 24 小时。
 - 自动恢复：到期自动执行 `pmset -a disablesleep 0`，恢复原有合盖睡眠行为。
 - 手动停止：随时点击“立即恢复合盖休眠”。
@@ -19,8 +20,18 @@
 > [!WARNING]
 > 合盖持续运行会产生热量。请连接电源、将电脑放在通风且坚硬的表面上；**不要将合盖运行的电脑放进背包或密闭空间**。
 
-- 首次开始或手动恢复时，需要输入 macOS 管理员密码。
-- 密码仅通过 `sudo` 的标准输入传递给系统命令；应用不会保存或写入密码。
+- 首次使用需要**一次性**启用免密码模式（两种方式任选其一）：
+  - 应用内点击「一键启用」，在弹出的系统对话框中授权一次；或
+  - 终端运行 `./Scripts/install-passwordless.zsh`
+- 启用后，应用通过 `sudo -n` 免密调用系统命令，之后不再弹出密码框。
+- 免密白名单仅包含以下两条命令（`sudoers` 按字面量匹配参数，无法借此执行其他命令）：
+
+  ```text
+  /usr/bin/pmset -a disablesleep 1
+  /usr/bin/pmset -a disablesleep 0
+  ```
+
+- 撤销免密：`./Scripts/install-passwordless.zsh --uninstall`（或手动 `sudo rm /etc/sudoers.d/lidawake`）。
 - 若手动中断应用，防睡眠设置可能仍在生效。可在终端恢复：
 
   ```zsh
@@ -61,16 +72,17 @@ swift run
 Assets/                     应用图标资源
 Scripts/build-app.zsh       构建并打包 macOS 应用
 Scripts/generate-icon.swift 生成图标 PNG 的辅助脚本
+Scripts/install-passwordless.zsh 一次性启用/移除免密白名单
 Sources/LidAwake/           SwiftUI 应用源码
 Package.swift               Swift Package 配置
 ```
 
 ## 工作原理
 
-1. 应用以管理员权限执行 `pmset -a disablesleep 1`。
-2. 同时启动独立的后台定时任务。
-3. 到期后，后台任务执行 `pmset -a disablesleep 0`。
-4. 如果用户手动恢复，应用会取消当前定时标识并立即恢复合盖睡眠。
+1. 应用通过 `sudo -n` 免密执行 `pmset -a disablesleep 1`（免密权限来自一次性写入的 `/etc/sudoers.d/lidawake` 白名单）。
+2. 同时在用户态启动一个后台定时进程，并在 `~/Library/Application Support/LidAwake/` 记录本次定时标识；应用退出后定时进程仍继续计时。
+3. 到期后，后台进程确认定时标识未被替换，执行 `pmset -a disablesleep 0` 恢复合盖睡眠。
+4. 如果用户手动恢复，应用先作废定时标识，再立即恢复合盖睡眠。
 
 ## 许可证
 

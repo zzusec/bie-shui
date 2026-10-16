@@ -32,6 +32,10 @@ private struct ContentView: View {
 
             statusCard
 
+            if controller.passwordlessReady == false {
+                passwordlessBanner
+            }
+
             if !controller.isActive {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("持续时间")
@@ -68,14 +72,12 @@ private struct ContentView: View {
 
                 if controller.isSleepDisabled {
                     Button("立即恢复合盖休眠", role: .destructive) {
-                        guard let password = PasswordPrompt.request() else { return }
-                        controller.stop(using: password)
+                        controller.stop()
                     }
                     .disabled(controller.isWorking)
                 } else {
                     Button("开始保持运行") {
-                        guard let password = PasswordPrompt.request() else { return }
-                        controller.start(for: selectedDuration, using: password)
+                        controller.start(for: selectedDuration)
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(controller.isWorking || selectedDuration == nil)
@@ -83,7 +85,7 @@ private struct ContentView: View {
             }
 
             if controller.isWorking {
-                ProgressView("正在请求系统管理员授权…")
+                ProgressView("正在应用设置…")
                     .controlSize(.small)
             }
 
@@ -91,6 +93,12 @@ private struct ContentView: View {
                 Text(errorMessage)
                     .font(.callout)
                     .foregroundStyle(.red)
+            }
+
+            if let infoMessage = controller.infoMessage {
+                Text(infoMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
 
             Divider()
@@ -136,6 +144,31 @@ private struct ContentView: View {
     }
 
     @ViewBuilder
+    private var passwordlessBanner: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "key.horizontal")
+                .foregroundStyle(.orange)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("尚未启用免密码模式")
+                    .font(.callout.weight(.medium))
+                Text("启用后，开始与恢复操作不再询问管理员密码（仅需一次性授权）。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+
+            Button("一键启用") {
+                controller.installPasswordless()
+            }
+            .disabled(controller.isWorking)
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    @ViewBuilder
     private var statusCard: some View {
         HStack(alignment: .center, spacing: 12) {
             Image(systemName: controller.isActive ? "lock.fill" : "moon.zzz")
@@ -157,7 +190,9 @@ private struct ContentView: View {
                 } else {
                     Text("合盖睡眠正常")
                         .font(.headline)
-                    Text("选择时长后开始。首次操作会要求输入管理员密码。")
+                    Text(controller.passwordlessReady == true
+                         ? "选择时长后开始。"
+                         : "选择时长后开始；首次使用需先启用免密码模式。")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -179,6 +214,8 @@ private final class SleepController: ObservableObject {
     @Published private(set) var endDate: Date?
     @Published private(set) var isWorking = false
     @Published var errorMessage: String?
+    @Published private(set) var passwordlessReady: Bool?
+    @Published private(set) var infoMessage: String?
 
     private let defaults = UserDefaults.standard
     private let endDateKey = "lidAwake.endDate"
@@ -211,7 +248,7 @@ private final class SleepController: ObservableObject {
         return "\(remainingSeconds) 秒"
     }
 
-    func start(for duration: TimeInterval?, using password: String) {
+    func start(for duration: TimeInterval?) {
         guard let duration else {
             errorMessage = "请输入大于 0、且最多 24 小时的时长。"
             return
@@ -219,41 +256,45 @@ private final class SleepController: ObservableObject {
 
         isWorking = true
         errorMessage = nil
+        infoMessage = nil
         let newEndDate = Date().addingTimeInterval(duration)
 
         Task {
             do {
-                try await PrivilegedPowerControl.start(for: Int(duration), using: password)
+                try await PrivilegedPowerControl.start(for: Int(duration))
                 endDate = newEndDate
                 defaults.set(newEndDate, forKey: endDateKey)
                 isSleepDisabled = true
+                passwordlessReady = true
             } catch {
-                errorMessage = "未能开启：\(error.localizedDescription)"
-                refreshPowerState()
+                errorMessage = errorText(for: error, action: "未能开启")
+                refreshPowerState(probe: false)
             }
             isWorking = false
         }
     }
 
-    func stop(using password: String) {
+    func stop() {
         isWorking = true
         errorMessage = nil
+        infoMessage = nil
 
         Task {
             do {
-                try await PrivilegedPowerControl.stop(using: password)
+                try await PrivilegedPowerControl.stop()
                 endDate = nil
                 defaults.removeObject(forKey: endDateKey)
                 isSleepDisabled = false
+                passwordlessReady = true
             } catch {
-                errorMessage = "未能恢复：\(error.localizedDescription)"
-                refreshPowerState()
+                errorMessage = errorText(for: error, action: "未能恢复")
+                refreshPowerState(probe: false)
             }
             isWorking = false
         }
     }
 
-    func refreshPowerState() {
+    func refreshPowerState(probe: Bool = true) {
         Task {
             do {
                 let output = try await CommandRunner.output(executable: "/usr/bin/pmset", arguments: ["-g"])
@@ -262,11 +303,61 @@ private final class SleepController: ObservableObject {
                 if !isSleepDisabled {
                     endDate = nil
                     defaults.removeObject(forKey: endDateKey)
+                    if probe {
+                        await probePasswordless()
+                    }
                 }
             } catch {
                 errorMessage = "无法读取电源状态：\(error.localizedDescription)"
             }
         }
+    }
+
+    func installPasswordless() {
+        isWorking = true
+        errorMessage = nil
+        infoMessage = nil
+
+        Task {
+            do {
+                try await PasswordlessSetup.install()
+            } catch {
+                let text = error.localizedDescription
+                if text == "已取消" {
+                    infoMessage = "已取消启用操作，系统设置未发生变更。"
+                } else {
+                    errorMessage = "启用失败：\(text)"
+                }
+                isWorking = false
+                return
+            }
+            infoMessage = "免密码模式已启用，后续操作不再需要输入密码。"
+            isWorking = false
+            await probePasswordless()
+        }
+    }
+
+    /// 在“系统合盖睡眠正常”的状态下，用一条无副作用的命令探测免密码模式是否已配置。
+    private func probePasswordless() async {
+        guard !isSleepDisabled, !isWorking, !isActive else { return }
+        do {
+            try await CommandRunner.runSudo(executable: "/usr/bin/pmset", arguments: ["-a", "disablesleep", "0"])
+            if !isSleepDisabled && !isWorking {
+                passwordlessReady = true
+            }
+        } catch {
+            if !isSleepDisabled && !isWorking {
+                passwordlessReady = false
+            }
+        }
+    }
+
+    private func errorText(for error: Error, action: String) -> String {
+        if let commandError = error as? CommandError, commandError.isPasswordRequired {
+            passwordlessReady = false
+            return "\(action)：需要先启用免密码模式，请点击上方「一键启用」。"
+        }
+        return "\(action)：\(error.localizedDescription)"
     }
 
     private func startTicker() {
@@ -282,30 +373,37 @@ private final class SleepController: ObservableObject {
 }
 
 private enum PrivilegedPowerControl {
-    private static let stateDirectory = "/var/db/LidAwake"
-    private static let tokenPath = "\(stateDirectory)/timer-token"
+    private static let stateDirectory = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("LidAwake", isDirectory: true)
+    private static var tokenURL: URL {
+        stateDirectory.appendingPathComponent("timer-token")
+    }
 
-    static func start(for seconds: Int, using password: String) async throws {
+    static func start(for seconds: Int) async throws {
+        try FileManager.default.createDirectory(at: stateDirectory, withIntermediateDirectories: true)
         let token = UUID().uuidString.lowercased()
-        let delayedReset = "/bin/sleep \(seconds); if [ \"$(/bin/cat \(tokenPath) 2>/dev/null)\" = \(shellQuote(token)) ]; then /usr/bin/pmset -a disablesleep 0; /bin/rm -f \(tokenPath); fi"
-        let setupCommand = "/bin/mkdir -p \(stateDirectory) && /bin/chmod 700 \(stateDirectory) && /bin/echo \(shellQuote(token)) > \(tokenPath) && /usr/bin/pmset -a disablesleep 1"
+        try Data(token.utf8).write(to: tokenURL)
 
-        try await CommandRunner.runSudo(command: setupCommand, password: password)
         do {
-            try await CommandRunner.runSudoInBackground(command: delayedReset, password: password)
+            try await CommandRunner.runSudo(executable: "/usr/bin/pmset", arguments: ["-a", "disablesleep", "1"])
         } catch {
-            try? await CommandRunner.runSudo(command: "/bin/rm -f \(tokenPath) && /usr/bin/pmset -a disablesleep 0", password: password)
+            try? FileManager.default.removeItem(at: tokenURL)
+            throw error
+        }
+
+        do {
+            try CommandRunner.spawnTimer(seconds: seconds, token: token, tokenPath: tokenURL.path)
+        } catch {
+            try? FileManager.default.removeItem(at: tokenURL)
+            try? await CommandRunner.runSudo(executable: "/usr/bin/pmset", arguments: ["-a", "disablesleep", "0"])
             throw error
         }
     }
 
-    static func stop(using password: String) async throws {
-        let command = "/bin/rm -f \(tokenPath) && /usr/bin/pmset -a disablesleep 0"
-        try await CommandRunner.runSudo(command: command, password: password)
-    }
-
-    private static func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    static func stop() async throws {
+        try? FileManager.default.removeItem(at: tokenURL)
+        try await CommandRunner.runSudo(executable: "/usr/bin/pmset", arguments: ["-a", "disablesleep", "0"])
     }
 }
 
@@ -338,37 +436,46 @@ private enum ExitPrompt {
     }
 }
 
-@MainActor
-private enum PasswordPrompt {
-    static func request() -> String? {
-        let alert = NSAlert()
-        alert.messageText = "需要管理员密码"
-        alert.informativeText = "请输入此 Mac 的登录密码以临时更改合盖睡眠设置。密码仅通过 sudo 的标准输入使用，不会被保存。"
-        alert.addButton(withTitle: "继续")
-        alert.addButton(withTitle: "取消")
+private enum PasswordlessSetup {
+    /// 一次性写入 /etc/sudoers.d/lidawake 白名单：
+    /// 仅允许当前用户免密执行 pmset -a disablesleep 1 / 0 这两条字面量命令。
+    static func install() async throws {
+        let userName = NSUserName()
+        guard userName.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil else {
+            throw CommandError(message: "当前用户名包含特殊字符，请在终端运行 Scripts/install-passwordless.zsh 完成配置。")
+        }
 
-        let passwordField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        passwordField.placeholderString = "macOS 登录密码"
-        alert.accessoryView = passwordField
+        let rule = "\(userName) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0"
+        let shellCommand = "T=$(/usr/bin/mktemp /tmp/lidawake-sudoers.XXXXXX); printf '%s\\n' '\(rule)' > $T && /usr/sbin/visudo -cf $T && /usr/bin/install -o root -g wheel -m 0440 $T /etc/sudoers.d/lidawake && /bin/rm -f $T"
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        guard !passwordField.stringValue.isEmpty else { return nil }
-        return passwordField.stringValue
+        let escaped = shellCommand
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let source = "do shell script \"\(escaped)\" with administrator privileges with prompt \"“别睡”需要一次性启用免密码模式（仅需输入一次管理员密码）。\""
+
+        do {
+            try await CommandRunner.runOSAScript(source)
+        } catch {
+            let text = error.localizedDescription
+            if text.localizedCaseInsensitiveContains("user canceled") || text.contains("(-128)") {
+                throw CommandError(message: "已取消")
+            }
+            throw error
+        }
     }
 }
 
 private enum CommandRunner {
-    static func runSudo(command: String, password: String) async throws {
+    /// 非交互式 sudo：依赖一次性配置的免密白名单（sudo -n），不会弹出密码提示。
+    static func runSudo(executable: String, arguments: [String]) async throws {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
-                let inputPipe = Pipe()
                 let outputPipe = Pipe()
                 let errorPipe = Pipe()
 
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-                process.arguments = ["-k", "-S", "-p", "", "/bin/sh", "-c", command]
-                process.standardInput = inputPipe
+                process.arguments = ["-n", executable] + arguments
                 process.standardOutput = outputPipe
                 process.standardError = errorPipe
 
@@ -387,8 +494,6 @@ private enum CommandRunner {
 
                 do {
                     try process.run()
-                    inputPipe.fileHandleForWriting.write(Data((password + "\n").utf8))
-                    try? inputPipe.fileHandleForWriting.close()
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -396,36 +501,56 @@ private enum CommandRunner {
         }
     }
 
-    static func runSudoInBackground(command: String, password: String) async throws {
+    /// 启动用户态后台定时进程：到期且定时标识仍未被替换时，免密恢复合盖睡眠。
+    /// 以当前用户身份运行，应用退出后仍会继续计时。
+    static func spawnTimer(seconds: Int, token: String, tokenPath: String) throws {
+        let script = "/bin/sleep \(seconds); if [ \"$(/bin/cat \(shellQuote(tokenPath)) 2>/dev/null)\" = \(shellQuote(token)) ]; then /usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0 && /bin/rm -f \(shellQuote(tokenPath)); fi"
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+    }
+
+    static func runOSAScript(_ source: String) async throws {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
-                let inputPipe = Pipe()
-                let nullDevice = FileHandle(forWritingAtPath: "/dev/null")!
+                let outputPipe = Pipe()
+                let errorPipe = Pipe()
 
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-                process.arguments = ["-k", "-S", "-p", "", "-b", "/bin/sh", "-c", command]
-                process.standardInput = inputPipe
-                process.standardOutput = nullDevice
-                process.standardError = nullDevice
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", source]
+                process.standardOutput = outputPipe
+                process.standardError = errorPipe
 
                 process.terminationHandler = { process in
+                    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    let output = String(decoding: outputData, as: UTF8.self)
+                    let error = String(decoding: errorData, as: UTF8.self)
+
                     if process.terminationStatus == 0 {
                         continuation.resume()
                     } else {
-                        continuation.resume(throwing: CommandError(message: "无法启动定时恢复任务（sudo 退出码：\(process.terminationStatus)）。"))
+                        continuation.resume(throwing: CommandError(message: error.isEmpty ? output : error))
                     }
                 }
 
                 do {
                     try process.run()
-                    inputPipe.fileHandleForWriting.write(Data((password + "\n").utf8))
-                    try? inputPipe.fileHandleForWriting.close()
                 } catch {
                     continuation.resume(throwing: error)
                 }
             }
         }
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 
     static func output(executable: String, arguments: [String]) async throws -> String {
@@ -465,6 +590,10 @@ private enum CommandRunner {
 
 private struct CommandError: LocalizedError {
     let message: String
+
+    var isPasswordRequired: Bool {
+        message.localizedCaseInsensitiveContains("password is required")
+    }
 
     var errorDescription: String? {
         message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
